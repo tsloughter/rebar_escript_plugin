@@ -56,7 +56,7 @@ init(State) ->
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
-    rebar_log:log(info, "Building escript...", []),
+    rebar_log:log(info, "Building escript", []),
     AppFile = case rebar_state:project_apps(State) of
                   [App] ->
                       rebar_app_info:app_file(App);
@@ -76,7 +76,7 @@ do(State) ->
 
 -spec format_error(any()) -> iolist().
 format_error(no_main_app) ->
-    io_lib:format("Multiple project apps and {rebar_escript_plugin, [{main_app, module()}]}. not set in rebar.config", []).
+    io_lib:format("Multiple project apps and {rebar_escript_plugin, [{main_app, atom()}]}. not set in rebar.config", []).
 
 %%------------------------------------------------------------------------------
 %% @doc
