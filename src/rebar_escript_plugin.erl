@@ -26,7 +26,7 @@
 
 -behaviour(provider).
 
--export([init/1, do/1, format_error/1, clean/2]).
+-export([init/1, do/1, format_error/1]).
 
 -define(PROVIDER, escriptize).
 -define(DEPS, [compile]).
@@ -57,21 +57,20 @@ init(State) ->
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
     rebar_log:log(info, "Building escript", []),
-    AppFile = case rebar_state:project_apps(State) of
-                  [App] ->
-                      rebar_app_info:app_file(App);
-                  Apps ->
-                      Cfg = rebar_state:get(State, ?MODULE, []),
-                      case proplists:get_value(main_app, Cfg, undefined) of
-                          undefined ->
-                              {error, {?MODULE, no_main_app}};
-                          Name ->
-                              App = rebar_app_utils:find(Name, Apps),
-                              rebar_app_info:app_file(App)
-                      end
-              end,
+    App1 = case rebar_state:project_apps(State) of
+              [App] ->
+                  App;
+              Apps ->
+                  Cfg = rebar_state:get(State, ?MODULE, []),
+                  case proplists:get_value(main_app, Cfg, undefined) of
+                      undefined ->
+                          {error, {?MODULE, no_main_app}};
+                      Name ->
+                          rebar_app_utils:find(Name, Apps)
+                  end
+          end,
 
-    run(State, AppFile),
+    run(State, App1),
     {ok, State}.
 
 -spec format_error(any()) -> iolist().
@@ -89,33 +88,20 @@ format_error(no_main_app) ->
 %% the application.
 %% @end
 %%------------------------------------------------------------------------------
--spec run(rebar_state:t(), file:filename()) -> ok.
-run(State, AppFile) ->
+-spec run(rebar_state:t(), rebar_app_info:t()) -> ok.
+run(State, App) ->
     BaseDir = rebar_state:get(State, base_dir, "."),
     TempDir = temp_dir(BaseDir),
-    ok = rebar_utils:ensure_dir(filename:join([TempDir, "dummy"])),
+    ok = filelib:ensure_dir(filename:join([TempDir, "dummy"])),
     ok = prepare_runner_module(TempDir),
-    AppsToStart = [AppName] = [app_name(State, AppFile)],
-    AppFiles = [AppFile | app_files(dep_dirs(State))],
-    PackagedApps = mk_links(TempDir, State, AppFiles),
+    AppName = rebar_app_info:name(App),
+    AppsToStart = [AppName],
+    Deps = rebar_state:all_deps(State),
+    Apps = [App | Deps],
+    PackagedApps = mk_links(TempDir, Apps),
     ok = prepare_main_module(TempDir, AppsToStart, PackagedApps),
-    Ez = create_ez(TempDir, State, AppFile, PackagedApps),
-    ok = create_escript(Ez, BaseDir, State, atom_to_list(AppName)).
-
-%%------------------------------------------------------------------------------
-%% @doc
-%% Remove the plugin's temporary directory and custom files after `rebar clean'.
-%% @end
-%%------------------------------------------------------------------------------
--spec clean(rebar_state:t(), file:filename()) -> ok.
-clean(State, _ResourceFile) ->
-    [App] = rebar_state:project_apps(State),
-    AppFile = rebar_app_info:app_file(App),
-    {OsFamily, _OsName} = os:type(),
-    BaseDir = rebar_utils:base_dir(State),
-    rm_rf(temp_dir(BaseDir)),
-    AppName = atom_to_list(app_name(State, AppFile)),
-    rm_rf(escript_path(OsFamily, BaseDir, AppName)).
+    Ez = create_ez(TempDir, App, PackagedApps),
+    ok = create_escript(Ez, BaseDir, State, ec_cnv:to_list(AppName)).
 
 %%%=============================================================================
 %%% Internal functions
@@ -123,37 +109,25 @@ clean(State, _ResourceFile) ->
 
 %%------------------------------------------------------------------------------
 %% @private
-%% Searches the given list of `lib' and `deps' directories for `.app' files,
-%% excluding system applications and the plugin itself.
-%%------------------------------------------------------------------------------
-app_files(DepDirs) ->
-    ExcludedApps = excluded_apps(),
-    AppDirLists = [filelib:wildcard(filename:join([D, "*"])) || D <- DepDirs],
-    [AppFile || AppDir <- lists:append(AppDirLists),
-                {true, AppFile} <- [rebar_app_utils:is_app_dir(AppDir)],
-                may_include(strip_extension(AppFile), ExcludedApps)].
-
-%%------------------------------------------------------------------------------
-%% @private
 %% Creates links to the application directories corresponding to the given list
 %% of `.app' files in a temporary directory. This is needed to get the directory
 %% structure desired by the code server for the created `.ez' archive.
 %%------------------------------------------------------------------------------
-mk_links(TempDir, State, AppFiles) ->
-    [mk_link(TempDir, State, AppFile) || AppFile <- AppFiles].
+mk_links(TempDir, Apps) ->
+    [mk_link(TempDir, App) || App <- Apps].
 
 %%------------------------------------------------------------------------------
 %% @private
 %% Creates a link to the application directory corresponding to the given
 %% `.app' file.
 %%------------------------------------------------------------------------------
-mk_link(TempDir, State, AppFile) ->
-    LinkName = app_link(TempDir, State, AppFile),
-    case file:make_symlink(app_dir(AppFile), LinkName) of
+mk_link(TempDir, App) ->
+    LinkName = app_link(TempDir, App),
+    case file:make_symlink(rebar_app_info:dir(App), LinkName) of
         ok ->
-            app_name(State, AppFile);
+            rebar_app_info:name(App);
         {error, eexist} ->
-            app_name(State, AppFile);
+            rebar_app_info:name(App);
         Error ->
             Error
     end.
@@ -161,59 +135,15 @@ mk_link(TempDir, State, AppFile) ->
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
-rm_rf(Path) -> rebar_file_utils:rm_rf(Path).
-
-%%------------------------------------------------------------------------------
-%% @private
-%% Returns the path to an application directory, based on the path to its
-%% `.app' file.
-%%------------------------------------------------------------------------------
-app_dir(AppFile) ->
-    SplittedPath = filename:split(filename:absname(AppFile)),
-    [_AppFileName | [_SrcOrEbin | RestPath]] = lists:reverse(SplittedPath),
-    filename:join(lists:reverse(RestPath)).
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-app_name(State, AppFile) ->
-    element(2, rebar_app_utils:app_name(State, AppFile)).
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-app_vsn(State, AppFile) ->
-    element(2, rebar_app_utils:app_vsn(State, AppFile)).
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-app_name_and_vsn(State, AppFile) ->
-    AppName = atom_to_list(app_name(State, AppFile)),
-    AppVsn = app_vsn(State, AppFile),
-    AppName ++ "-" ++ AppVsn.
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-app_link(TempDir, State, AppFile) ->
-    filename:join([TempDir, app_name_and_vsn(State, AppFile)]).
+app_link(TempDir, App) ->
+    AppNameVsn = ec_cnv:to_list(rebar_app_info:name(App))
+        ++ "-" ++ ec_cnv:to_list(rebar_app_info:original_vsn(App)),
+    filename:join([TempDir, AppNameVsn]).
 
 %%------------------------------------------------------------------------------
 %% @private
 %%------------------------------------------------------------------------------
 temp_dir(BaseDir) -> filename:join([BaseDir, ?TEMP_DIR]).
-
-%%------------------------------------------------------------------------------
-%% @private
-%% Returns a list of the `lib' and `deps' directories used by the current
-%% project/application. This includes the path configured as `deps_dir' and the
-%% paths specified as `lib_dirs' in the `rebar.config' file.
-%%------------------------------------------------------------------------------
-dep_dirs(State) ->
-    DepsDir = rebar_prv_install_deps:get_deps_dir(State),
-    LibDirs = rebar_state:get(State, lib_dirs, []),
-    [DepsDir | [filename:asbname(Dir) || Dir <- LibDirs]].
 
 %%------------------------------------------------------------------------------
 %% @private
@@ -233,12 +163,14 @@ dep_dirs(State) ->
 %%  + ...
 %%
 %%------------------------------------------------------------------------------
-create_ez(TempDir, State, AppFile, PackagedApps) ->
-    Apps = string:join([atom_to_list(App) || App <- PackagedApps], ","),
+create_ez(TempDir, App, PackagedApps) ->
+    Apps = string:join([ec_cnv:to_list(A) || A <- PackagedApps], ","),
     Paths = filename:join(["{" ++ Apps ++ "}-*", "{ebin,priv}"]),
+    AppNameVsn = ec_cnv:to_list(rebar_app_info:name(App))
+        ++ "-" ++ ec_cnv:to_list(rebar_app_info:original_vsn(App)),
     {ok, {_, Archive}} =
         zip:create(
-          app_name_and_vsn(State, AppFile) ++ ".ez",
+          AppNameVsn ++ ".ez",
           filelib:wildcard(Paths, TempDir) ++
               filelib:wildcard("*.beam", TempDir),
           [{cwd, TempDir}, {uncompress, all}, memory]),
@@ -265,11 +197,6 @@ create_escript(Ez, BaseDir, State, EScript) ->
     Sections = [shebang, comment, {emu_args, EmuArgs}, {archive, Ez}],
     ok = escript:create(Path, Sections),
     ok = set_executable(OsFamily, Path).
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-strip_extension(FilePath) -> filename:rootname(filename:basename(FilePath)).
 
 %%------------------------------------------------------------------------------
 %% @private
@@ -342,17 +269,3 @@ get_emu_args(State) ->
     case proplists:get_value(emu_args, Cfg, "") of
         EmuArgs when is_list(EmuArgs) -> EmuArgs
     end.
-
-%%------------------------------------------------------------------------------
-%% @private
-%%------------------------------------------------------------------------------
-may_include(AppStr, ExcludedApps) ->
-    lists:all(fun(App) -> string:str(App, AppStr) =:= 0 end, ExcludedApps).
-
-%%------------------------------------------------------------------------------
-%% @private
-%% Returns a list of strings representing applications to exclude from
-%% packaging.
-%%------------------------------------------------------------------------------
-excluded_apps() ->
-    [atom_to_list(?MODULE) | filelib:wildcard("*", code:lib_dir())].
